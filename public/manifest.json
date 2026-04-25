@@ -1,0 +1,16 @@
+{
+  "short_name": "MyFactor",
+  "name": "MyFactor: Контроль лечения",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ],
+  "start_url": ".",
+  "display": "standalone",
+  "theme_color": "#00897B",
+  "background_color": "#E0F7FA"
+}
