@@ -1,13 +1,5 @@
 /**
- * ПРАВИЛА БЕЗОПАСНОСТИ FIRESTORE (Скопируйте это в Firebase Console -> Rules):
- * rules_version = '2';
- * service cloud.firestore {
- * match /databases/{database}/documents {
- * match /artifacts/{appId}/users/{userId}/{document=**} {
- * allow read, write: if request.auth != null && request.auth.uid == userId;
- * }
- * }
- * }
+ * ПОЛНАЯ ВЕРСИЯ: Мульти-инъекции, PDF, Врач, Группировка и Системные пуши
  */
 
 import React, { useState, useEffect, useMemo } from 'react';
@@ -18,6 +10,7 @@ import {
 import { 
   getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut 
 } from 'firebase/auth';
+import { getMessaging, getToken, onMessage } from "firebase/messaging";
 import { 
   Plus, History, Package, Settings, Trash2, Droplet, CheckCircle2, X, Calendar, 
   Bell, Clock, AlertTriangle, Palette, Type, Maximize, Layout, ChevronRight, 
@@ -39,7 +32,11 @@ const firebaseConfig = {
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
 const db = getFirestore(app);
+const messaging = typeof window !== "undefined" ? getMessaging(app) : null;
 const appId = 'my-factor-v1'; 
+
+// ВСТАВЬТЕ СЮДА КЛЮЧ ИЗ ШАГА 1 (Generate Key Pair)
+const VAPID_KEY = "BJEaSzR1koKzUs-y9lbs5LxbCtkIaWGHRd4gXg-dB67flxPOgIrDz5bWV2w5vkDp_XNJwxlLgoIKywQIKw9cMOw";
 
 // --- UI Компоненты ---
 const Button = ({ children, onClick, variant = 'primary', className = '', loading = false, style = {}, type = "button" }) => {
@@ -148,15 +145,8 @@ export default function App() {
       setHistory(logs.sort((a,b) => (b.timestamp?.seconds || 0) - (a.timestamp?.seconds || 0)));
     });
     const unsubRem = onSnapshot(collection(db, ...base, 'reminders'), s => setReminders(s.docs.map(d => ({id: d.id, ...d.data()}))));
-    
-    const unsubDoc = onSnapshot(doc(db, ...base, 'settings', 'doctor'), sDoc => {
-      if (sDoc.exists()) setDoctorConfig(sDoc.data());
-    });
-
-    getDoc(doc(db, ...base, 'settings', 'ui')).then(sDoc => {
-      if (sDoc.exists()) setSettings(sDoc.data());
-      setLoading(false);
-    });
+    const unsubDoc = onSnapshot(doc(db, ...base, 'settings', 'doctor'), sDoc => { if (sDoc.exists()) setDoctorConfig(sDoc.data()); });
+    getDoc(doc(db, ...base, 'settings', 'ui')).then(sDoc => { if (sDoc.exists()) setSettings(sDoc.data()); setLoading(false); });
     return () => { unsubInv(); unsubHist(); unsubRem(); unsubDoc(); };
   }, [user]);
 
@@ -175,16 +165,23 @@ export default function App() {
     if (user) await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'ui'), updated);
   };
 
+  // ЛОГИКА СИСТЕМНЫХ ПУШЕЙ
   const requestPushPermission = async () => {
     try {
       const permission = await Notification.requestPermission();
-      if (permission === 'granted') {
-        alert("Отлично! Разрешение получено. Для настройки фоновых уведомлений потребуется Шаг 2 (см. инструкцию).");
-      } else {
-        alert("Разрешение не предоставлено. Проверьте настройки Safari.");
+      if (permission === 'granted' && messaging) {
+        const currentToken = await getToken(messaging, { vapidKey: VAPID_KEY });
+        if (currentToken) {
+          // Сохраняем токен в профиль пользователя, чтобы сервер знал, кому слать пуш
+          await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'push'), {
+            token: currentToken,
+            updatedAt: serverTimestamp()
+          });
+          alert("Уведомления успешно настроены!");
+        }
       }
     } catch (error) {
-      alert("На этом устройстве системные PWA-уведомления пока не поддерживаются (нужна iOS 16.4+ и добавление на экран 'Домой').");
+      alert("Ошибка при настройке уведомлений. Убедитесь, что приложение добавлено на экран 'Домой'.");
     }
   };
 
@@ -210,46 +207,22 @@ export default function App() {
   const saveDoctorVisit = async (e) => {
     e.preventDefault();
     const date = e.target.visitDate.value; 
-    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'doctor'), {
-      enabled: true, visitDate: date || null
-    });
+    await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'doctor'), { enabled: true, visitDate: date || null });
     setIsDoctorModal(false);
   };
 
   const doctorAlerts = useMemo(() => {
     const alerts = [];
     if (!doctorConfig.enabled) return alerts;
-
     const now = new Date();
     const visitDate = doctorConfig.visitDate ? new Date(doctorConfig.visitDate) : null;
-    const isVisitFuture = visitDate && visitDate > now;
-
-    if (isVisitFuture) {
+    if (visitDate && visitDate > now) {
       const diffHours = (visitDate - now) / (1000 * 60 * 60);
-      if (diffHours <= 48) {
-        alerts.push({
-          type: 'doctor_b',
-          title: 'Скоро визит к врачу!',
-          text: `Назначено на ${visitDate.toLocaleDateString('ru-RU')} в ${visitDate.toLocaleTimeString('ru-RU', {hour: '2-digit', minute:'2-digit'})}`,
-          urgent: true
-        });
-      }
+      if (diffHours <= 48) alerts.push({ type: 'doctor_b', title: 'Скоро визит к врачу!', text: `Назначено на ${visitDate.toLocaleDateString('ru-RU')} в ${visitDate.toLocaleTimeString('ru-RU', {hour: '2-digit', minute:'2-digit'})}`, urgent: true });
     } else {
-      const month = now.getMonth(); 
-      const day = now.getDate();
-      const dayOfWeek = now.getDay(); 
       const targetMonths = [1, 4, 7, 10]; 
-      const isTargetMonth = targetMonths.includes(month);
-      const isFirstWeek = day <= 7;
-      const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
-
-      if (isTargetMonth && isFirstWeek && isWeekday) {
-        alerts.push({
-          type: 'doctor_a',
-          title: 'Плановый осмотр',
-          text: 'Пора позвонить и записаться к гематологу.',
-          urgent: false
-        });
+      if (targetMonths.includes(now.getMonth()) && now.getDate() <= 7 && now.getDay() >= 1 && now.getDay() <= 5) {
+        alerts.push({ type: 'doctor_a', title: 'Плановый осмотр', text: 'Пора позвонить и записаться к гематологу.', urgent: false });
       }
     }
     return alerts;
@@ -307,63 +280,15 @@ export default function App() {
     });
   }, [reminders, history]);
 
-  // ПОЛНАЯ ЛОГИКА ЭКСПОРТА В PDF
   const handlePrintPDF = () => {
     const iframe = document.createElement('iframe');
     iframe.style.display = 'none';
     document.body.appendChild(iframe);
-    
-    let html = `
-      <html>
-      <head>
-        <title>Медицинский отчет MyFactor</title>
-        <style>
-          body { font-family: sans-serif; padding: 20px; color: #333; }
-          h1 { color: #00897B; margin-bottom: 5px; }
-          p { margin: 5px 0; color: #666; }
-          table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-          th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-          th { background-color: #E0F7FA; color: #00897B; }
-          .summary { margin-top: 20px; padding: 15px; background: #f9f9f9; border-radius: 8px; }
-        </style>
-      </head>
-      <body>
-        <h1>Выписка из журнала MyFactor</h1>
-        <p><strong>Пациент:</strong> ${user?.email}</p>
-        <p><strong>Год отчета:</strong> ${selectedStatsYear}</p>
-        <p><strong>Дата формирования:</strong> ${new Date().toLocaleDateString('ru-RU')}</p>
-        
-        <div class="summary">
-          <h3>Краткая сводка за ${selectedStatsYear} год:</h3>
-          <p>Всего инъекций: <strong>${filteredStats.count}</strong></p>
-          <p>Всего введено: <strong>${filteredStats.total.toLocaleString()} ед.</strong></p>
-        </div>
-
-        <table>
-          <tr><th>Дата</th><th>Препарат</th><th>Доза (ед)</th><th>Причина / Место</th></tr>
-    `;
-    
-    // Сортируем историю по дате (по убыванию) перед добавлением в PDF
-    const historyForYear = history.filter(h => {
-      const d = h.timestamp?.toDate();
-      return d && d.getFullYear().toString() === selectedStatsYear;
-    });
-
-    historyForYear.forEach(h => {
-      const d = h.timestamp?.toDate();
-      if (d) {
-         html += `<tr><td>${d.toLocaleDateString('ru-RU')}</td><td>${h.medName}</td><td>${h.dose}</td><td>${h.reason}</td></tr>`;
-      }
-    });
-
+    let html = `<html><head><title>Медицинский отчет MyFactor</title><style>body { font-family: sans-serif; padding: 20px; color: #333; } h1 { color: #00897B; } table { width: 100%; border-collapse: collapse; margin-top: 20px; } th, td { border: 1px solid #ddd; padding: 10px; text-align: left; } th { background-color: #E0F7FA; }</style></head><body><h1>Выписка из журнала MyFactor</h1><p><strong>Пациент:</strong> ${user?.email}</p><p><strong>Год отчета:</strong> ${selectedStatsYear}</p><table><tr><th>Дата</th><th>Препарат</th><th>Доза (ед)</th><th>Причина / Место</th></tr>`;
+    const historyForYear = history.filter(h => h.timestamp?.toDate().getFullYear().toString() === selectedStatsYear);
+    historyForYear.forEach(h => { html += `<tr><td>${h.timestamp.toDate().toLocaleDateString('ru-RU')}</td><td>${h.medName}</td><td>${h.dose}</td><td>${h.reason}</td></tr>`; });
     html += `</table></body></html>`;
-    
-    iframe.contentWindow.document.write(html);
-    iframe.contentWindow.document.close();
-    iframe.contentWindow.focus();
-    iframe.contentWindow.print();
-    
-    // Удаляем iframe после вызова окна печати
+    iframe.contentWindow.document.write(html); iframe.contentWindow.document.close(); iframe.contentWindow.print();
     setTimeout(() => document.body.removeChild(iframe), 2000);
   };
 
@@ -386,7 +311,6 @@ export default function App() {
                 <div className="flex-1 text-left"><p className={`${sz.xs} font-black text-blue-400 uppercase tracking-widest mb-1`}>{alert.title}</p><p className={`font-black text-slate-700 ${sz.sm}`}>{alert.text}</p></div>
               </div>
             ))}
-
             {remindersWithStatus.filter(r => r.isDue).map(rem => (
               <div key={rem.id} className="bg-red-50 border border-red-100 p-5 rounded-[2rem] flex items-center gap-4 animate-pulse shadow-sm">
                 <AlertTriangle className="text-red-500 shrink-0" size={is.lg} />
@@ -394,7 +318,6 @@ export default function App() {
                 <button onClick={() => setIsInjectModal(true)} className="text-white p-3.5 rounded-2xl shadow-lg bg-red-500"><Plus size={is.sm}/></button>
               </div>
             ))}
-
             <div className={`rounded-[2.5rem] ${cs.p} text-white shadow-2xl relative overflow-hidden transition-all duration-500`} style={{ backgroundColor: settings.accentColor }}>
               <div className="relative z-10"><p className={`text-white/90 ${sz.base} font-black uppercase tracking-widest opacity-90 capitalize mb-2`}>Итоги за {new Date().toLocaleString('ru-RU', { month: 'long' })}</p><div className="mt-2 flex flex-col gap-2"><h2 className={`${sz.xl} font-black leading-none`}>{history.filter(h => h.timestamp?.toDate().getMonth() === new Date().getMonth() && h.timestamp?.toDate().getFullYear() === new Date().getFullYear()).length} <span className={sz.lg}>инъекций</span></h2><p className={`${sz.lg} font-bold opacity-90`}>{history.filter(h => h.timestamp?.toDate().getMonth() === new Date().getMonth() && h.timestamp?.toDate().getFullYear() === new Date().getFullYear()).reduce((s, h) => s + Number(h.dose || 0), 0).toLocaleString()} <span className={sz.base}>ед. за месяц</span></p></div><Button variant="secondary" className={`mt-8 bg-white/20 text-white border-none backdrop-blur-md py-5 ${sz.base}`} onClick={() => setIsInjectModal(true)}><Plus size={is.sm}/> Записать инъекцию</Button></div>
               <div className="absolute -right-8 -bottom-8 text-white/10 rotate-12"><Droplet size={120} /></div>
@@ -407,10 +330,7 @@ export default function App() {
         )}
 
         {view === 'inventory' && ( <div className="space-y-4 animate-in slide-in-from-right duration-500">
-            <div className={`bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm space-y-3`}>
-               <div className="flex justify-between items-center"><h2 className={`${sz.base} font-black tracking-tight text-slate-800`}>Общий запас</h2><span className={`${sz.xs} font-black uppercase text-slate-400`}>{Math.round(totalInventoryStats.qty)} / {totalInventoryStats.init} ед.</span></div>
-               <div className="h-4 bg-slate-100 rounded-full overflow-hidden shadow-inner"><div className="h-full transition-all duration-1000" style={{ width: `${Math.min(100, totalInventoryStats.percent)}%`, backgroundColor: settings.accentColor }}/></div>
-            </div>
+            <div className={`bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm space-y-3`}><div className="flex justify-between items-center"><h2 className={`${sz.base} font-black tracking-tight text-slate-800`}>Общий запас</h2><span className={`${sz.xs} font-black uppercase text-slate-400`}>{Math.round(totalInventoryStats.qty)} / {totalInventoryStats.init} ед.</span></div><div className="h-4 bg-slate-100 rounded-full overflow-hidden shadow-inner"><div className="h-full transition-all duration-1000" style={{ width: `${Math.min(100, totalInventoryStats.percent)}%`, backgroundColor: settings.accentColor }}/></div></div>
             <div className="flex gap-2">
               <button onClick={() => setInventorySort(inventorySort === 'expiry' ? 'added' : 'expiry')} className="flex-1 bg-white p-4 rounded-[1.8rem] border border-slate-100 shadow-sm flex items-center justify-center gap-2 text-slate-600 active:scale-95 transition-all"><SlidersHorizontal size={16} style={{ color: settings.accentColor }} /> <span className={`${sz.xs} font-black uppercase`}>Сорт: {inventorySort === 'expiry' ? 'По сроку' : 'По дате'}</span></button>
               <button onClick={() => setIsMedModal(true)} className="w-14 h-14 text-white rounded-[1.8rem] flex items-center justify-center shadow-lg active:scale-90" style={{ backgroundColor: settings.accentColor }}><Plus size={is.base}/></button>
@@ -418,163 +338,33 @@ export default function App() {
             {groupedInventory.map(folder => (
                <div key={folder.name} className="space-y-2">
                   <div onClick={() => setExpandedFolders(p => ({...p, [folder.name]: !p[folder.name]}))} className="bg-white p-5 rounded-[2.2rem] border border-slate-100 shadow-sm flex justify-between items-center cursor-pointer active:scale-[0.98] transition-all"><div className="flex items-center gap-3"><div className="p-2.5 bg-slate-50 rounded-2xl" style={{ color: settings.accentColor }}>{expandedFolders[folder.name] ? <FolderOpen size={is.base}/> : <Folder size={is.base}/>}</div><div><h3 className={`font-black ${sz.base} text-slate-800`}>{folder.name}</h3><p className={`${sz.xs} font-bold text-slate-400 uppercase tracking-widest mt-1`}>{Math.round(folder.totalQty)} ед. (Партий: {folder.items.length})</p></div></div><div className="text-slate-300">{expandedFolders[folder.name] ? <ChevronDown size={20}/> : <ChevronRight size={20}/>}</div></div>
-                  {expandedFolders[folder.name] && (
-                    <div className="pl-4 pr-2 space-y-3 animate-in slide-in-from-top duration-300 pb-2">
-                      {folder.items.map(m => {
-                        const spent = (m.initialQuantity || 0) - (m.quantity || 0); const percent = m.initialQuantity ? Math.round((m.quantity/m.initialQuantity)*100) : 0;
-                        return ( <div key={m.id} className={`bg-white/80 backdrop-blur-sm ${cs.p} rounded-[1.8rem] border border-white shadow-sm space-y-3 relative overflow-hidden`}><div className="flex justify-between items-start text-left"><div className="flex-1"><h4 className={`font-black ${sz.sm} leading-tight text-slate-700 flex items-center gap-2`}><Layers size={14} style={{ color: settings.accentColor }}/> Партия от {m.createdAt?.toDate().toLocaleDateString('ru-RU') || '...'}</h4>{m.expiryDate && <span className={`${sz.xs} text-red-400 font-black uppercase flex items-center gap-1 mt-1.5`}><Calendar size={12}/> Годен до: {new Date(m.expiryDate).toLocaleDateString('ru-RU', {month:'short', year:'numeric'})}</span>}</div><button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', m.id))} className="text-slate-200 p-1 hover:text-red-400 transition-colors"><Trash2 size={is.sm}/></button></div><div className="space-y-2"><div className={`flex justify-between ${sz.xs} font-black uppercase text-slate-400`}><span>Остаток: {Math.round(m.quantity*100)/100} / {m.initialQuantity}</span><span style={{ color: settings.accentColor }}>{percent}%</span></div><div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full transition-all duration-1000" style={{ width: `${Math.min(100, percent)}%`, backgroundColor: settings.accentColor }}/></div></div></div> );
-                      })}
-                    </div>
-                  )}
+                  {expandedFolders[folder.name] && ( <div className="pl-4 pr-2 space-y-3 animate-in slide-in-from-top duration-300 pb-2">{folder.items.map(m => { const spent = (m.initialQuantity || 0) - (m.quantity || 0); const percent = m.initialQuantity ? Math.round((m.quantity/m.initialQuantity)*100) : 0; return ( <div key={m.id} className={`bg-white/80 backdrop-blur-sm ${cs.p} rounded-[1.8rem] border border-white shadow-sm space-y-3 relative overflow-hidden`}><div className="flex justify-between items-start text-left"><div className="flex-1"><h4 className={`font-black ${sz.sm} leading-tight text-slate-700 flex items-center gap-2`}><Layers size={14} style={{ color: settings.accentColor }}/> Партия от {m.createdAt?.toDate().toLocaleDateString('ru-RU') || '...'}</h4>{m.expiryDate && <span className={`${sz.xs} text-red-400 font-black uppercase flex items-center gap-1 mt-1.5`}><Calendar size={12}/> Годен до: {new Date(m.expiryDate).toLocaleDateString('ru-RU', {month:'short', year:'numeric'})}</span>}</div><button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'inventory', m.id))} className="text-slate-200 p-1 hover:text-red-400 transition-colors"><Trash2 size={is.sm}/></button></div><div className="space-y-2"><div className={`flex justify-between ${sz.xs} font-black uppercase text-slate-400`}><span>Остаток: {Math.round(m.quantity*100)/100} / {m.initialQuantity}</span><span style={{ color: settings.accentColor }}>{percent}%</span></div><div className="h-2 bg-slate-100 rounded-full overflow-hidden"><div className="h-full transition-all duration-1000" style={{ width: `${Math.min(100, percent)}%`, backgroundColor: settings.accentColor }}/></div></div></div> ); })}</div> )}
                </div>
             ))}
         </div> )}
 
-        {/* --- ВОССТАНОВЛЕННЫЙ РАЗДЕЛ "ЖУРНАЛ" (ВКЛЮЧАЕТ СПИСОК, АНАЛИТИКУ И PDF) --- */}
         {view === 'history' && (
           <div className="space-y-4 animate-in slide-in-from-right duration-500 pb-10">
-            {/* Переключатель вкладок и кнопка PDF */}
             <div className="bg-white p-2 rounded-[2.2rem] border border-slate-100 shadow-sm flex items-center gap-2">
               <button onClick={() => setHistoryTab('list')} className={`flex-1 py-4 rounded-[1.8rem] font-black ${sz.sm} transition-all flex items-center justify-center gap-2 ${historyTab === 'list' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 bg-transparent'}`}><History size={18}/> Журнал</button>
               <button onClick={() => setHistoryTab('stats')} className={`flex-1 py-4 rounded-[1.8rem] font-black ${sz.sm} transition-all flex items-center justify-center gap-2 ${historyTab === 'stats' ? 'bg-slate-900 text-white shadow-lg' : 'text-slate-400 bg-transparent'}`}><BarChart3 size={18}/> Анализ</button>
-              
-              {/* Кнопка экспорта в PDF */}
-              <button onClick={handlePrintPDF} className="p-4 rounded-[1.8rem] bg-slate-50 text-slate-400 hover:text-white hover:bg-[#00897B] transition-all active:scale-95 shadow-sm">
-                <Printer size={20}/>
-              </button>
+              <button onClick={handlePrintPDF} className="p-4 rounded-[1.8rem] bg-slate-50 text-slate-400 hover:text-white hover:bg-[#00897B] transition-all active:scale-95 shadow-sm"><Printer size={20}/></button>
             </div>
-
-            {/* ВКЛАДКА "ЖУРНАЛ" (СПИСОК ИНЪЕКЦИЙ) */}
             {historyTab === 'list' ? (
               <div className="space-y-4">
                 {Object.entries(groupedHistory).sort((a,b) => b[0] - a[0]).map(([year, yearData]) => (
                   <div key={year} className="space-y-3">
-                    {/* Плашка Года */}
-                    <div onClick={() => setExpandedYear(expandedYear === year ? null : year)} className="bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm flex justify-between items-center cursor-pointer active:scale-[0.98] transition-all">
-                      <div className="flex items-center gap-3">
-                        <div className="p-2.5 bg-slate-50 rounded-2xl" style={{ color: settings.accentColor }}>{expandedYear === year ? <ChevronDown size={is.base}/> : <ChevronRight size={is.base}/>}</div>
-                        <div>
-                          <p className={`font-black ${sz.base} text-slate-800`}>{year} год</p>
-                          <p className={`${sz.xs} font-bold text-slate-400 uppercase tracking-widest mt-1`}>{yearData.total.toLocaleString()} ед. всего</p>
-                        </div>
-                      </div>
-                      <Archive size={16} className="text-slate-300"/>
-                    </div>
-                    
-                    {/* Месяца внутри года */}
-                    {expandedYear === year && (
-                      <div className="pl-4 space-y-3 animate-in slide-in-from-top duration-300">
-                        {Object.entries(yearData.months).map(([month, monthData]) => (
-                          <div key={month} className="space-y-2">
-                            {/* Плашка Месяца */}
-                            <div onClick={() => setExpandedMonth(expandedMonth === month ? null : month)} className="bg-white/60 backdrop-blur-sm p-4 rounded-[1.8rem] border border-white/50 shadow-sm flex justify-between items-center cursor-pointer active:scale-[0.98] transition-all">
-                              <div className="flex items-center gap-3">
-                                <div className="p-2 bg-white rounded-xl shadow-sm" style={{ color: settings.accentColor }}>{expandedMonth === month ? <ChevronDown size={is.sm}/> : <ChevronRight size={is.sm}/>}</div>
-                                <p className={`font-black ${sz.sm} text-slate-700 capitalize`}>{month}</p>
-                              </div>
-                              <p className={`${sz.xs} font-black px-3 py-1 bg-white rounded-full shadow-sm`} style={{ color: settings.accentColor }}>{monthData.total.toLocaleString()} ед.</p>
-                            </div>
-                            
-                            {/* Записи внутри месяца */}
-                            {expandedMonth === month && (
-                              <div className="pl-4 space-y-2 animate-in zoom-in-95 duration-200">
-                                {monthData.entries.map(h => (
-                                  <div key={h.id} className="bg-white p-4 rounded-[1.5rem] border border-slate-50 flex justify-between items-center shadow-sm">
-                                    <div className="flex gap-3 items-center text-left">
-                                      <div className="w-10 h-10 bg-slate-50 rounded-2xl flex items-center justify-center shadow-inner" style={{ color: settings.accentColor }}><CheckCircle2 size={is.sm}/></div>
-                                      <div>
-                                        <p className={`font-black ${sz.xs} text-slate-800`}>{h.medName}</p>
-                                        <p className={`${sz.xs} text-slate-400 font-bold uppercase tracking-tight`}>{h.reason}</p>
-                                      </div>
-                                    </div>
-                                    <div className="text-right">
-                                      <p className={`font-black ${sz.sm}`} style={{ color: settings.accentColor }}>-{h.dose}</p>
-                                      <p className={`${sz.xs} text-slate-300 font-bold mt-1`}>{h.timestamp?.toDate ? h.timestamp.toDate().toLocaleDateString('ru-RU') : '...'}</p>
-                                    </div>
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                    <div onClick={() => setExpandedYear(expandedYear === year ? null : year)} className="bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm flex justify-between items-center cursor-pointer active:scale-[0.98] transition-all"><div className="flex items-center gap-3"><div className="p-2.5 bg-slate-50 rounded-2xl" style={{ color: settings.accentColor }}>{expandedYear === year ? <ChevronDown size={is.base}/> : <ChevronRight size={is.base}/>}</div><div><p className={`font-black ${sz.base} text-slate-800`}>{year} год</p><p className={`${sz.xs} font-bold text-slate-400 uppercase tracking-widest mt-1`}>{yearData.total.toLocaleString()} ед. всего</p></div></div><Archive size={16} className="text-slate-300"/></div>
+                    {expandedYear === year && ( <div className="pl-4 space-y-3 animate-in slide-in-from-top duration-300">{Object.entries(yearData.months).map(([month, monthData]) => ( <div key={month} className="space-y-2"><div onClick={() => setExpandedMonth(expandedMonth === month ? null : month)} className="bg-white/60 backdrop-blur-sm p-4 rounded-[1.8rem] border border-white/50 shadow-sm flex justify-between items-center cursor-pointer active:scale-[0.98] transition-all"><div className="flex items-center gap-3"><div className="p-2 bg-white rounded-xl shadow-sm" style={{ color: settings.accentColor }}>{expandedMonth === month ? <ChevronDown size={is.sm}/> : <ChevronRight size={is.sm}/>}</div><p className={`font-black ${sz.sm} text-slate-700 capitalize`}>{month}</p></div><p className={`${sz.xs} font-black px-3 py-1 bg-white rounded-full shadow-sm`} style={{ color: settings.accentColor }}>{monthData.total.toLocaleString()} ед.</p></div>{expandedMonth === month && ( <div className="pl-4 space-y-2 animate-in zoom-in-95 duration-200">{monthData.entries.map(h => ( <div key={h.id} className="bg-white p-4 rounded-[1.5rem] border border-slate-50 flex justify-between items-center shadow-sm"><div className="flex gap-3 items-center text-left"><div className="w-10 h-10 bg-slate-50 rounded-2xl flex items-center justify-center shadow-inner" style={{ color: settings.accentColor }}><CheckCircle2 size={is.sm}/></div><div><p className={`font-black ${sz.xs} text-slate-800`}>{h.medName}</p><p className={`${sz.xs} text-slate-400 font-bold uppercase tracking-tight`}>{h.reason}</p></div></div><div className="text-right"><p className={`font-black ${sz.sm}`} style={{ color: settings.accentColor }}>-{h.dose}</p><p className={`${sz.xs} text-slate-300 font-bold mt-1`}>{h.timestamp?.toDate ? h.timestamp.toDate().toLocaleDateString('ru-RU') : '...'}</p></div></div> ))}</div> )}</div> ))}</div> )}
                   </div>
                 ))}
               </div>
             ) : (
-              /* ВКЛАДКА "АНАЛИЗ" (ГРАФИКИ И МИШЕНИ) */
               <div className="space-y-6 animate-in fade-in duration-500 text-left">
-                {/* Выбор года для анализа */}
-                <div className="bg-white p-4 rounded-[2rem] border border-slate-100 shadow-sm flex items-center justify-between">
-                   <div className="flex items-center gap-3"><div className="p-2 bg-slate-50 rounded-xl text-slate-400"><Calendar size={18}/></div><span className={`${sz.sm} font-black text-slate-800`}>Отчет за:</span></div>
-                   <select value={selectedStatsYear} onChange={(e) => setSelectedStatsYear(e.target.value)} className="bg-slate-50 border-none rounded-xl px-4 py-2 font-black text-sm outline-none text-[#00897B]">
-                     {Object.keys(groupedHistory).sort((a,b) => b-a).map(y => <option key={y} value={y}>{y} год</option>)}
-                     {Object.keys(groupedHistory).length === 0 && <option value={new Date().getFullYear()}>{new Date().getFullYear()} год</option>}
-                   </select>
-                </div>
-
-                {/* Общая статистика года */}
-                <div className={`p-6 rounded-[2.5rem] text-white shadow-xl relative overflow-hidden`} style={{ backgroundColor: settings.accentColor }}>
-                   <div className="relative z-10 text-left">
-                      <p className={`${sz.xs} font-black uppercase opacity-70 mb-1`}>Итоги {selectedStatsYear}</p>
-                      <div className="flex justify-between items-end">
-                         <div><h2 className={`${sz.xl} font-black leading-none`}>{filteredStats.total.toLocaleString()}</h2><p className={`${sz.sm} font-bold opacity-80 uppercase mt-2`}>Ед. введено</p></div>
-                         <div className="text-right"><h3 className={`${sz.lg} font-black leading-none`}>{filteredStats.count}</h3><p className={`${sz.xs} font-bold opacity-80 uppercase mt-2`}>Инъекций</p></div>
-                      </div>
-                   </div>
-                </div>
-                
-                {/* График расхода по полугодиям */}
-                <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm space-y-6 text-left">
-                  <div className="flex justify-between items-center">
-                    <h3 className={`font-black ${sz.sm} text-slate-800 flex items-center gap-2`}><TrendingUp size={18} style={{ color: settings.accentColor }}/> Расход</h3>
-                    <div className="flex bg-slate-50 p-1 rounded-xl">
-                      <button onClick={() => setAnalyticsHalf(1)} className={`px-3 py-1.5 rounded-lg ${sz.xs} font-black transition-all ${analyticsHalf===1 ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400'}`}>1 Плг.</button>
-                      <button onClick={() => setAnalyticsHalf(2)} className={`px-3 py-1.5 rounded-lg ${sz.xs} font-black transition-all ${analyticsHalf===2 ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400'}`}>2 Плг.</button>
-                    </div>
-                  </div>
-                  
-                  <div className="flex items-end justify-between h-32 pt-2 px-1 gap-2">
-                    {filteredStats.chartData.map(([month, val]) => {
-                      const max = Math.max(...filteredStats.chartData.map(d => d[1]), 1);
-                      const height = (val / max) * 100;
-                      return (
-                        <div key={month} className="flex-1 flex flex-col items-center gap-2 group">
-                          <span className="text-[8px] font-black text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity absolute -mt-4">{val}</span>
-                          <div className="w-full bg-slate-50 rounded-t-lg relative overflow-hidden h-full"><div className="absolute bottom-0 left-0 right-0 transition-all duration-1000 ease-out rounded-t-md" style={{ height: `${height}%`, backgroundColor: settings.accentColor }} /></div>
-                          <span className={`text-[10px] font-black text-slate-400 uppercase`}>{month}</span>
-                        </div>
-                      );
-                    })}
-                  </div>
-                </div>
-
-                {/* Мишени и причины */}
-                <div className="space-y-4 pb-6">
-                  <h3 className={`font-black ${sz.sm} text-slate-800 px-2 text-left`}>Мишени и причины ({selectedStatsYear})</h3>
-                  {filteredStats.reasonList.map(([reason, data]) => { 
-                    const avgInterval = data.dates.length > 1 ? Math.round((data.dates[0] - data.dates[data.dates.length-1]) / (1000*60*60*24) / (data.dates.length-1)) : null; 
-                    return (
-                      <div key={reason} className="bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm flex justify-between items-center">
-                        <div className="flex-1 text-left">
-                          <div className="flex items-center gap-2 mb-1">
-                            <div className={`w-2 h-2 rounded-full ${reason.toLowerCase().includes('профил') ? 'bg-blue-400' : 'bg-red-400'}`} />
-                            <h4 className={`font-black ${sz.base} text-slate-800`}>{reason}</h4>
-                          </div>
-                          <div className="flex gap-4">
-                            <p className={`${sz.xs} font-bold text-slate-400 uppercase text-left`}>Случаев: <span className="text-slate-700">{data.count}</span></p>
-                            {avgInterval && <p className={`${sz.xs} font-bold text-slate-400 uppercase`}>Раз в {avgInterval} дн.</p>}
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          <p className={`font-black ${sz.sm} text-slate-800`}>{data.total.toLocaleString()}</p>
-                          <p className={`${sz.xs} font-bold text-slate-300 uppercase mt-1`}>ед. всего</p>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
+                <div className="bg-white p-4 rounded-[2rem] border border-slate-100 shadow-sm flex items-center justify-between"><div className="flex items-center gap-3"><div className="p-2 bg-slate-50 rounded-xl text-slate-400"><Calendar size={18}/></div><span className={`${sz.sm} font-black text-slate-800`}>Отчет за:</span></div><select value={selectedStatsYear} onChange={(e) => setSelectedStatsYear(e.target.value)} className="bg-slate-50 border-none rounded-xl px-4 py-2 font-black text-sm outline-none text-[#00897B]">{Object.keys(groupedHistory).sort((a,b) => b-a).map(y => <option key={y} value={y}>{y} год</option>)}{Object.keys(groupedHistory).length === 0 && <option value={new Date().getFullYear()}>{new Date().getFullYear()} год</option>}</select></div>
+                <div className={`p-6 rounded-[2.5rem] text-white shadow-xl relative overflow-hidden`} style={{ backgroundColor: settings.accentColor }}><div className="relative z-10 text-left"><p className={`${sz.xs} font-black uppercase opacity-70 mb-1`}>Итоги {selectedStatsYear}</p><div className="flex justify-between items-end"><div><h2 className={`${sz.xl} font-black leading-none`}>{filteredStats.total.toLocaleString()}</h2><p className={`${sz.sm} font-bold opacity-80 uppercase mt-2`}>Ед. введено</p></div><div className="text-right"><h3 className={`${sz.lg} font-black leading-none`}>{filteredStats.count}</h3><p className={`${sz.xs} font-bold opacity-80 uppercase mt-2`}>Инъекций</p></div></div></div></div>
+                <div className="bg-white p-6 rounded-[2.5rem] border border-slate-100 shadow-sm space-y-6 text-left"><div className="flex justify-between items-center"><h3 className={`font-black ${sz.sm} text-slate-800 flex items-center gap-2`}><TrendingUp size={18} style={{ color: settings.accentColor }}/> Расход</h3><div className="flex bg-slate-50 p-1 rounded-xl"><button onClick={() => setAnalyticsHalf(1)} className={`px-3 py-1.5 rounded-lg ${sz.xs} font-black transition-all ${analyticsHalf===1 ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400'}`}>1 Плг.</button><button onClick={() => setAnalyticsHalf(2)} className={`px-3 py-1.5 rounded-lg ${sz.xs} font-black transition-all ${analyticsHalf===2 ? 'bg-white shadow-sm text-slate-800' : 'text-slate-400'}`}>2 Плг.</button></div></div><div className="flex items-end justify-between h-32 pt-2 px-1 gap-2">{filteredStats.chartData.map(([month, val]) => { const max = Math.max(...filteredStats.chartData.map(d => d[1]), 1); const height = (val / max) * 100; return ( <div key={month} className="flex-1 flex flex-col items-center gap-2 group"><span className="text-[8px] font-black text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity absolute -mt-4">{val}</span><div className="w-full bg-slate-50 rounded-t-lg relative overflow-hidden h-full"><div className="absolute bottom-0 left-0 right-0 transition-all duration-1000 ease-out rounded-t-md" style={{ height: `${height}%`, backgroundColor: settings.accentColor }} /></div><span className={`text-[10px] font-black text-slate-400 uppercase`}>{month}</span></div> );})}</div></div>
+                <div className="space-y-4 pb-6"><h3 className={`font-black ${sz.sm} text-slate-800 px-2 text-left`}>Мишени и причины ({selectedStatsYear})</h3>{filteredStats.reasonList.map(([reason, data]) => { const avgInterval = data.dates.length > 1 ? Math.round((data.dates[0] - data.dates[data.dates.length-1]) / (1000*60*60*24) / (data.dates.length-1)) : null; return ( <div key={reason} className="bg-white p-6 rounded-[2.2rem] border border-slate-100 shadow-sm flex justify-between items-center"><div className="flex-1 text-left"><div className="flex items-center gap-2 mb-1"><div className={`w-2 h-2 rounded-full ${reason.toLowerCase().includes('профил') ? 'bg-blue-400' : 'bg-red-400'}`} /><h4 className={`font-black ${sz.base} text-slate-800`}>{reason}</h4></div><div className="flex gap-4"><p className={`${sz.xs} font-bold text-slate-400 uppercase text-left`}>Случаев: <span className="text-slate-700">{data.count}</span></p>{avgInterval && <p className={`${sz.xs} font-bold text-slate-400 uppercase`}>Раз в {avgInterval} дн.</p>}</div></div><div className="text-right"><p className={`font-black ${sz.sm} text-slate-800`}>{data.total.toLocaleString()}</p><p className={`${sz.xs} font-bold text-slate-300 uppercase mt-1`}>ед. всего</p></div></div> ); })}</div>
               </div>
             )}
           </div>
@@ -586,37 +376,9 @@ export default function App() {
               <h2 className={`${sz.lg} font-black tracking-tight`}>Ваш График</h2>
               <button onClick={() => setIsReminderModal(true)} className="w-12 h-12 text-white rounded-full flex items-center justify-center shadow-lg active:scale-90" style={{ backgroundColor: settings.accentColor }}><Plus size={is.base}/></button>
             </div>
-            
-            <div className={`bg-white ${cs.p} rounded-[2.2rem] border border-slate-100 shadow-sm space-y-4`}>
-              <div className="flex justify-between items-start text-left">
-                <div className="flex gap-4 items-center">
-                  <div className="p-3 rounded-2xl bg-blue-50 text-blue-500 shadow-sm"><Stethoscope size={is.base} /></div>
-                  <div>
-                    <p className={`font-black ${sz.base} text-slate-800`}>Визит к врачу</p>
-                    <p className={`${sz.xs} font-bold text-slate-400 uppercase mt-1`}>
-                      {doctorConfig.visitDate ? 'Назначен визит' : 'Плановый раз в квартал'}
-                    </p>
-                  </div>
-                </div>
-                <button onClick={() => setIsDoctorModal(true)} className="text-slate-400 bg-slate-50 p-2 rounded-xl font-bold text-xs hover:bg-blue-50 hover:text-blue-500 transition-all">Настроить</button>
-              </div>
-              <div className="flex flex-col gap-2">
-                <div className={`p-4 rounded-2xl flex justify-between items-center shadow-inner ${doctorConfig.visitDate && new Date(doctorConfig.visitDate) > new Date() ? 'bg-blue-500 text-white shadow-lg' : 'bg-slate-50 text-slate-500'}`}>
-                   <span className={`${sz.xs} font-black uppercase tracking-widest`}>
-                     {doctorConfig.visitDate ? new Date(doctorConfig.visitDate).toLocaleDateString('ru-RU') : 'Ожидание'}
-                   </span>
-                   <span className={`${sz.xs} font-black uppercase`}>
-                     {doctorConfig.visitDate ? new Date(doctorConfig.visitDate).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'}) : 'Не назначено'}
-                   </span>
-                </div>
-              </div>
-            </div>
-
+            <div className={`bg-white ${cs.p} rounded-[2.2rem] border border-slate-100 shadow-sm space-y-4`}><div className="flex justify-between items-start text-left"><div className="flex gap-4 items-center"><div className="p-3 rounded-2xl bg-blue-50 text-blue-500 shadow-sm"><Stethoscope size={is.base} /></div><div><p className={`font-black ${sz.base} text-slate-800`}>Визит к врачу</p><p className={`${sz.xs} font-bold text-slate-400 uppercase mt-1`}>{doctorConfig.visitDate ? 'Назначен визит' : 'Плановый раз в квартал'}</p></div></div><button onClick={() => setIsDoctorModal(true)} className="text-slate-400 bg-slate-50 p-2 rounded-xl font-bold text-xs hover:bg-blue-50 hover:text-blue-500 transition-all">Настроить</button></div><div className="flex flex-col gap-2"><div className={`p-4 rounded-2xl flex justify-between items-center shadow-inner ${doctorConfig.visitDate && new Date(doctorConfig.visitDate) > new Date() ? 'bg-blue-500 text-white shadow-lg' : 'bg-slate-50 text-slate-500'}`}><span className={`${sz.xs} font-black uppercase tracking-widest`}>{doctorConfig.visitDate ? new Date(doctorConfig.visitDate).toLocaleDateString('ru-RU') : 'Ожидание'}</span><span className={`${sz.xs} font-black uppercase`}>{doctorConfig.visitDate ? new Date(doctorConfig.visitDate).toLocaleTimeString('ru-RU', {hour:'2-digit', minute:'2-digit'}) : 'Не назначено'}</span></div></div></div>
             {remindersWithStatus.map(rem => (
-              <div key={rem.id} className={`bg-white ${cs.p} rounded-[2.2rem] border-2 ${rem.isDue ? 'border-red-200' : 'border-transparent'} shadow-sm space-y-4`}>
-                <div className="flex justify-between items-start text-left"><div className="flex gap-4 items-center"><div className={`p-3 rounded-2xl shadow-sm ${rem.isDue ? 'bg-red-50 text-red-500' : 'bg-slate-50'}`} style={{ color: !rem.isDue ? settings.accentColor : undefined }}><Clock size={is.base} /></div><div><p className={`font-black ${sz.base} text-slate-800`}>{rem.medName}</p><p className={`${sz.xs} font-bold text-slate-400 uppercase mt-1`}>Раз в {rem.intervalDays} дн.</p></div></div><button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'reminders', rem.id))} className="text-slate-200 p-2"><Trash2 size={20}/></button></div>
-                <div className="flex flex-col gap-2"><div className={`p-4 rounded-2xl flex justify-between items-center shadow-inner ${rem.isDue ? 'bg-red-500 text-white shadow-lg' : 'bg-slate-50 text-slate-500'}`}><span className={`${sz.xs} font-black uppercase tracking-widest`}>След.: {rem.nextDate.toLocaleDateString('ru-RU')}</span><span className={`${sz.xs} font-black uppercase`}>{rem.statusText}</span></div></div>
-              </div>
+              <div key={rem.id} className={`bg-white ${cs.p} rounded-[2.2rem] border-2 ${rem.isDue ? 'border-red-200' : 'border-transparent'} shadow-sm space-y-4`}><div className="flex justify-between items-start text-left"><div className="flex gap-4 items-center"><div className={`p-3 rounded-2xl shadow-sm ${rem.isDue ? 'bg-red-50 text-red-500' : 'bg-slate-50'}`} style={{ color: !rem.isDue ? settings.accentColor : undefined }}><Clock size={is.base} /></div><div><p className={`font-black ${sz.base} text-slate-800`}>{rem.medName}</p><p className={`${sz.xs} font-bold text-slate-400 uppercase mt-1`}>Раз в {rem.intervalDays} дн.</p></div></div><button onClick={() => deleteDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'reminders', rem.id))} className="text-slate-200 p-2"><Trash2 size={20}/></button></div><div className="flex flex-col gap-2"><div className={`p-4 rounded-2xl flex justify-between items-center shadow-inner ${rem.isDue ? 'bg-red-500 text-white shadow-lg' : 'bg-slate-50 text-slate-500'}`}><span className={`${sz.xs} font-black uppercase tracking-widest`}>След.: {rem.nextDate.toLocaleDateString('ru-RU')}</span><span className={`${sz.xs} font-black uppercase`}>{rem.statusText}</span></div></div></div>
             ))}
           </div>
         )}
@@ -629,60 +391,25 @@ export default function App() {
       </nav>
 
       <Modal isOpen={isDoctorModal} onClose={() => setIsDoctorModal(false)} title="Назначить визит" titleClass={sz.lg}>
-        <form onSubmit={saveDoctorVisit} className="space-y-6 text-left">
-          <div className="p-5 bg-blue-50 rounded-[2rem] border border-blue-100 mb-4">
-            <p className="text-xs font-bold text-blue-600">Система сама напомнит вам записаться к врачу в будние дни начала Февраля, Мая, Августа и Ноября.</p>
-          </div>
-          <div className="space-y-2">
-            <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Точная дата и время визита</label>
-            <input 
-              name="visitDate" 
-              type="datetime-local" 
-              defaultValue={doctorConfig.visitDate ? doctorConfig.visitDate : ''}
-              className="w-full p-5 bg-slate-50 rounded-2xl border-none ring-2 ring-slate-100 font-bold text-sm outline-none text-[#00897B]" 
-            />
-          </div>
-          <div className="flex gap-3">
-             <Button variant="outline" type="button" onClick={async () => { await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'doctor'), { enabled: true, visitDate: null }); setIsDoctorModal(false); }} className="py-4 text-xs w-1/3">Сбросить</Button>
-             <Button style={{ backgroundColor: settings.accentColor }} type="submit" className="py-4 text-sm flex-1">Сохранить</Button>
-          </div>
-        </form>
+        <form onSubmit={saveDoctorVisit} className="space-y-6 text-left"><div className="p-5 bg-blue-50 rounded-[2rem] border border-blue-100 mb-4"><p className="text-xs font-bold text-blue-600">Система сама напомнит вам записаться к врачу в будние дни начала Февраля, Мая, Августа и Ноября.</p></div><div className="space-y-2"><label className="text-[10px] font-black text-slate-400 uppercase tracking-widest ml-2">Точная дата и время визита</label><input name="visitDate" type="datetime-local" defaultValue={doctorConfig.visitDate ? doctorConfig.visitDate : ''} className="w-full p-5 bg-slate-50 rounded-2xl border-none ring-2 ring-slate-100 font-bold text-sm outline-none text-[#00897B]" /></div><div className="flex gap-3"><Button variant="outline" type="button" onClick={async () => { await setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'settings', 'doctor'), { enabled: true, visitDate: null }); setIsDoctorModal(false); }} className="py-4 text-xs w-1/3">Сбросить</Button><Button style={{ backgroundColor: settings.accentColor }} type="submit" className="py-4 text-sm flex-1">Сохранить</Button></div></form>
       </Modal>
 
       <Modal isOpen={isSettingsModal} onClose={() => setIsSettingsModal(false)} title="Настройки" titleClass={sz.lg}>
         <div className="space-y-8 pb-6 text-left">
           <div className="space-y-4"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><Type size={20} /> <span>Размер текста</span></div><div className="flex bg-slate-100 p-1.5 rounded-[1.5rem]">{['sm', 'md', 'lg'].map(size => (<button key={size} onClick={() => updateSettings({ fontSize: size })} className={`flex-1 py-2.5 ${sz.xs} font-black rounded-xl transition-all ${settings.fontSize === size ? 'bg-white shadow-md text-slate-800' : 'text-slate-400'}`}>{size === 'sm' ? 'Мал' : size === 'md' ? 'Срд' : 'Блш'}</button>))}</div></div>
           
+          {/* ВОССТАНОВЛЕННЫЕ НАСТРОЙКИ */}
           <div className="space-y-4"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><Maximize size={20} /> <span>Размер иконок</span></div><div className="flex bg-slate-100 p-1.5 rounded-[1.5rem]">{['sm', 'md', 'lg'].map(size => (<button key={size} onClick={() => updateSettings({ iconSize: size })} className={`flex-1 py-2.5 ${sz.xs} font-black rounded-xl transition-all ${settings.iconSize === size ? 'bg-white shadow-md text-slate-800' : 'text-slate-400'}`}>{size === 'sm' ? 'Мал' : size === 'md' ? 'Срд' : 'Блш'}</button>))}</div></div>
           <div className="space-y-4"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><Layout size={20} /> <span>Размер окон</span></div><div className="flex bg-slate-100 p-1.5 rounded-[1.5rem]">{['sm', 'md', 'lg'].map(size => (<button key={size} onClick={() => updateSettings({ cardSize: size })} className={`flex-1 py-2.5 ${sz.xs} font-black rounded-xl transition-all ${settings.cardSize === size ? 'bg-white shadow-md text-slate-800' : 'text-slate-400'}`}>{size === 'sm' ? 'Мал' : size === 'md' ? 'Срд' : 'Блш'}</button>))}</div></div>
           <div className="space-y-4"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><Palette size={20} /> <span>Цвет фона</span></div><div className="flex flex-wrap gap-4">{['#E0F7FA', '#E8EAF6', '#F5F5F5', '#FFF3E0', '#F1F8E9', '#FFFFFF'].map(color => (<button key={color} onClick={() => updateSettings({ bgColor: color })} className={`w-12 h-12 rounded-2xl border-4 transition-all active:scale-90 ${settings.bgColor === color ? 'border-slate-800 scale-110 shadow-lg' : 'border-slate-200'}`} style={{ backgroundColor: color }} />))}</div></div>
           <div className="space-y-4"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><Droplet size={20} /> <span>Цвет темы</span></div><div className="flex flex-wrap gap-4">{['#00897B', '#1E88E5', '#5E35B1', '#E53935', '#FB8C00', '#000000'].map(color => (<button key={color} onClick={() => updateSettings({ accentColor: color })} className={`w-12 h-12 rounded-2xl border-4 transition-all active:scale-90 ${settings.accentColor === color ? 'border-slate-800 scale-110 shadow-lg' : 'border-white'}`} style={{ backgroundColor: color }} />))}</div></div>
 
-          <div className="space-y-4 pt-6 border-t border-slate-100">
-            <div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><BellRing size={20} /> <span>Уведомления (iOS)</span></div>
-            <Button variant="outline" onClick={requestPushPermission} className="py-4 text-xs text-blue-500 border-blue-200 hover:bg-blue-50 w-full">
-              Запросить системное разрешение
-            </Button>
-            <p className="text-[9px] font-bold text-slate-400 uppercase tracking-wide px-2 leading-relaxed">
-              Для работы фоновых пушей требуется настройка Firebase Cloud Messaging и iOS 16.4+.
-            </p>
-          </div>
-
-          <div className="pt-6 border-t border-slate-100">
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Аккаунт</p>
-            <div className="p-4 bg-slate-50 rounded-2xl flex flex-col gap-4">
-               <div className="flex items-center justify-between">
-                 <div className="flex items-center gap-3"><div className="p-2 bg-white rounded-xl shadow-sm text-[#00897B]"><Mail size={18}/></div><span className="text-xs font-bold text-slate-600 truncate max-w-[120px]">{user?.email}</span></div>
-                 <button onClick={() => signOut(auth)} className="text-red-500 font-black text-[10px] flex items-center gap-2 px-3 py-2 bg-red-50 rounded-xl active:scale-95 transition-all"><LogOut size={14}/> Выйти</button>
-               </div>
-               {user?.metadata?.creationTime && ( <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">В системе с {new Date(user.metadata.creationTime).toLocaleDateString('ru-RU', {month: 'long', year: 'numeric'})}</div> )}
-            </div>
-          </div>
+          <div className="space-y-4 pt-6 border-t border-slate-100"><div className={`flex items-center gap-3 text-slate-600 font-black ${sz.sm}`}><BellRing size={20} /> <span>Уведомления (iOS)</span></div><Button variant="outline" onClick={requestPushPermission} className="py-4 text-xs text-blue-500 border-blue-200 hover:bg-blue-50 w-full">Запросить системное разрешение</Button><p className="text-[9px] font-bold text-slate-400 uppercase tracking-wide px-2 leading-relaxed">Для работы фоновых пушей требуется настройка Firebase Cloud Messaging и iOS 16.4+.</p></div>
+          <div className="pt-6 border-t border-slate-100"><p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-4">Аккаунт</p><div className="p-4 bg-slate-50 rounded-2xl flex flex-col gap-4"><div className="flex items-center justify-between"><div className="flex items-center gap-3"><div className="p-2 bg-white rounded-xl shadow-sm text-[#00897B]"><Mail size={18}/></div><span className="text-xs font-bold text-slate-600 truncate max-w-[120px]">{user?.email}</span></div><button onClick={() => signOut(auth)} className="text-red-500 font-black text-[10px] flex items-center gap-2 px-3 py-2 bg-red-50 rounded-xl active:scale-95 transition-all"><LogOut size={14}/> Выйти</button></div>{user?.metadata?.creationTime && ( <div className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">В системе с {new Date(user.metadata.creationTime).toLocaleDateString('ru-RU', {month: 'long', year: 'numeric'})}</div> )}</div></div>
           <Button style={{ backgroundColor: settings.accentColor }} onClick={() => setIsSettingsModal(false)} className={`mt-6 ${sz.sm}`}>Закрыть</Button>
         </div>
       </Modal>
 
-      {/* ОСТАЛЬНЫЕ МОДАЛКИ БЕЗ ИЗМЕНЕНИЙ */}
       <Modal isOpen={isMedModal} onClose={() => setIsMedModal(false)} title="Новое лекарство" titleClass={sz.lg}>
         <form onSubmit={async (e) => { e.preventDefault(); const d = new FormData(e.target); await addDoc(collection(db, 'artifacts', appId, 'users', user.uid, 'inventory'), { name: d.get('name'), quantity: parseFloat(d.get('q')), initialQuantity: parseFloat(d.get('q')), expiryDate: d.get('expiry'), unit: 'ед', createdAt: serverTimestamp() }); setIsMedModal(false); }} className="space-y-5 text-left"><input name="name" placeholder="Название" className="w-full p-5 bg-slate-50 rounded-2xl border-none ring-2 ring-slate-100 font-bold text-sm" required /><input name="q" type="number" placeholder="Количество единиц" className="w-full p-5 bg-slate-50 rounded-2xl border-none ring-2 ring-slate-100 font-bold text-sm" required /><div className="space-y-1"><label className="text-[10px] font-black text-slate-400 uppercase ml-2">Срок годности</label><input name="expiry" type="date" className="w-full p-5 bg-slate-50 rounded-2xl border-none ring-2 ring-slate-100 font-bold text-sm" required /></div><Button style={{ backgroundColor: settings.accentColor }} type="submit" className="py-4 text-sm">Добавить</Button></form>
       </Modal>
